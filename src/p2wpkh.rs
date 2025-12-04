@@ -3,12 +3,11 @@ mod tests {
     use std::str::FromStr;
 
     use bitcoin::{
-        Address, Amount, PrivateKey, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+        Address, Amount, CompressedPublicKey, OutPoint, PrivateKey, ScriptBuf, Sequence,
+        Transaction, TxIn, TxOut, Txid, WPubkeyHash, Witness,
         absolute::LockTime,
-        consensus::serialize,
         hashes::Hash,
         key::Secp256k1,
-        script::PushBytesBuf,
         secp256k1::Message,
         sighash::{EcdsaSighashType, SighashCache},
         transaction::Version,
@@ -31,7 +30,11 @@ mod tests {
             PrivateKey::from_slice(&PRIVATE_KEY_BYTES, bitcoin::Network::Bitcoin).unwrap();
         let secp = Secp256k1::signing_only();
         let pubkey = privkey.public_key(&secp);
-        let addr = Address::p2pkh(&pubkey, bitcoin::Network::Testnet);
+        // let wpkh = pubkey.wpubkey_hash().expect("key is compressed");
+        let addr = Address::p2wpkh(
+            &CompressedPublicKey(pubkey.inner),
+            bitcoin::Network::Testnet,
+        );
         println!("Address: {:?}", addr);
 
         let client = Client::new();
@@ -56,7 +59,7 @@ mod tests {
             witness: Witness::new(),
         };
 
-        println!("value :{:?}", utxo.value);
+        // println!("value :{:?}", utxo.value);
 
         let fee = 500;
         let txout = TxOut {
@@ -65,44 +68,32 @@ mod tests {
         };
 
         let mut raw_tx = Transaction {
-            version: Version::ONE,
+            version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![txin],
             output: vec![txout],
         };
 
-        let cash = SighashCache::new(&raw_tx);
+        let input_index = 0;
+
+        let mut cash = SighashCache::new(&mut raw_tx);
         let sig_hash = cash
-            .legacy_signature_hash(0, &addr.script_pubkey(), EcdsaSighashType::All.to_u32())
+            .p2wpkh_signature_hash(
+                input_index,
+                &addr.script_pubkey(),
+                Amount::from_sat(utxo.value),
+                EcdsaSighashType::All,
+            )
             .unwrap();
         println!("sig_hash:{:?}", sig_hash.to_string());
-        let msg = Message::from_digest(sig_hash.to_raw_hash().to_byte_array());
-        let sig = secp.sign_ecdsa(&msg, &privkey.inner);
-        println!("sig:{:?}", hex::encode(&sig.serialize_compact()));
-        let mut sig_der = sig.serialize_der().to_vec();
-        println!("sig_der:{:?}", hex::encode(&sig_der));
-        sig_der.push(EcdsaSighashType::All.to_u32() as u8);
+        let msg = Message::from(sig_hash);
+        let signature = secp.sign_ecdsa(&msg, &privkey.inner);
 
-        let mut sig_push = PushBytesBuf::with_capacity(sig_der.len());
-        sig_push.extend_from_slice(&sig_der).unwrap();
-        let script_sig = ScriptBuf::builder()
-            .push_slice(&sig_push)
-            .push_key(&pubkey)
-            .into_script();
+        let signature = bitcoin::ecdsa::Signature {
+            signature,
+            sighash_type: EcdsaSighashType::All,
+        };
 
-        raw_tx.input[0].script_sig = script_sig;
-
-        let raw_tx_bytes = serialize(&raw_tx);
-        let raw_tx = hex::encode(&raw_tx_bytes);
-
-        let res = client
-            .post(format!("{}/tx", BTC_TEST_URL))
-            .body(raw_tx)
-            .send()
-            .await
-            .unwrap();
-
-        let txid = res.text().await.unwrap();
-        println!("txid: {}", txid);
+        *cash.witness_mut(input_index).unwrap() = Witness::p2wpkh(&signature, &pubkey.inner);
     }
 }
